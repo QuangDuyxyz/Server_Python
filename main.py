@@ -10,24 +10,30 @@ import random
 from dotenv import load_dotenv
 import json
 import uvicorn
+import random
+import string
 
 # Tải biến môi trường từ file .env
 load_dotenv()
 
+# Hàm tạo key ngẫu nhiên
+def generate_random_key():
+    key_length = 16
+    chars = string.ascii_uppercase + string.digits
+    return "".join(random.choice(chars) for _ in range(key_length))
+
 app = FastAPI(title="Key Management Colony API")
 
-# Cấu hình CORS - cho phép các nguồn gốc khác truy cập API
+# Cấu hình CORS - đơn giản hóa để chỉ cho phép nguồn local truy cập API
 app.add_middleware(
     CORSMiddleware,
+    # Chỉ cần giữ lại các origin local phổ biến
+    # "*" sẽ cho phép tất cả các nguồn, nhưng không nên dùng trong production
     allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173", 
-        "http://localhost:5174",
-        "https://key-colony-auto.vercel.app",
-        "https://key-management-colony.vercel.app",
-        "https://key-colony-auto-quangduyxyz.vercel.app"
-    ,
-        "https://f44e-27-74-243-28.ngrok-free.app"],
+        "http://localhost:3000",  # Default React port
+        "http://localhost:5173",  # Vite default port
+        "http://localhost:5174",  # Vite alternate port
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -79,8 +85,18 @@ def execute_query(sql, params=None, fetch=True, many=False):
         if not fetch:
             connection.commit()
             affected_rows = cursor.rowcount
-            print(f"[SQL Result] Số dòng ảnh hưởng: {affected_rows}")
-            result = {"affected_rows": affected_rows}
+            print(f"[SQL Result] So dong anh huong: {affected_rows}")
+            
+            # Lấy ID của bản ghi vừa chèn nếu là INSERT
+            last_insert_id = None
+            if sql.strip().upper().startswith("INSERT"):
+                last_insert_id = cursor.lastrowid
+                print(f"[SQL Result] Last Insert ID: {last_insert_id}")
+            
+            result = {
+                "affected_rows": affected_rows,
+                "last_insert_id": last_insert_id
+            }
         # Các truy vấn lấy dữ liệu (SELECT)
         else:
             if many:
@@ -428,6 +444,13 @@ async def update_device(device_id: int, update: DeviceUpdate):
             detail=f"Error updating device: {str(e)}"
         )
 
+# Helper để tạo key ngẫu nhiên
+def generate_random_key():
+    import random
+    import string
+    chars = string.ascii_uppercase + string.digits
+    return "".join(random.choice(chars) for _ in range(16))
+
 # Generate key for device
 @app.post("/api/devices/{device_id}/generate-key")
 async def generate_key_for_device(device_id: int, user_id: int = Query(..., description="User ID performing the action")):
@@ -435,21 +458,27 @@ async def generate_key_for_device(device_id: int, user_id: int = Query(..., desc
         print(f"[API] Tạo key cho thiết bị ID={device_id} bởi người dùng ID={user_id}")
         
         # Kiểm tra quyền người dùng
+        print(f"[DEBUG] Kiểm tra quyền người dùng ID={user_id}")
         users = execute_query(
             "SELECT id, role FROM users WHERE id = %s",
-            [user_id]
+            [user_id],
+            fetch=True,  # Make sure we're fetching data
+            many=True    # Expect a list of results
         )
         
         if not users:
             raise HTTPException(status_code=403, detail="Người dùng không tồn tại")
-            
+        
+        print(f"[DEBUG] Thông tin người dùng: {users}")
         user = users[0]
         
         # Nếu không phải admin, kiểm tra quyền
         if user["role"] != "admin":
             permissions = execute_query(
                 "SELECT id FROM user_permissions WHERE user_id = %s AND permission = %s",
-                [user_id, Permissions.MANAGE_KEYS]
+                [user_id, Permissions.MANAGE_KEYS],
+                fetch=True,
+                many=True
             )
             
             if not permissions:
@@ -459,53 +488,65 @@ async def generate_key_for_device(device_id: int, user_id: int = Query(..., desc
                 )
         
         # Kiểm tra thiết bị tồn tại
+        print(f"[DEBUG] Kiểm tra thiết bị ID={device_id}")
         device = execute_query(
             "SELECT * FROM devices WHERE id = %s",
-            [device_id]
+            [device_id],
+            fetch=True,
+            many=False
         )
         
         if not device:
             raise HTTPException(status_code=404, detail="Device not found")
         
+        print(f"[DEBUG] Thông tin thiết bị: {device}")
+        
         # Sinh key ngẫu nhiên
         key = generate_random_key()
+        print(f"[DEBUG] Key được tạo: {key}")
+        
         current_time = datetime.datetime.now()
         expires_at = current_time + datetime.timedelta(days=365)  # Hết hạn sau 1 năm
+        expiry_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[DEBUG] Ngày hết hạn: {expiry_str}")
         
         # Cập nhật key cho thiết bị
+        print(f"[DEBUG] Cập nhật key cho thiết bị ID={device_id}")
         result = execute_query(
             "UPDATE devices SET key_code = %s, expires_at = %s WHERE id = %s",
-            [key, expires_at.strftime("%Y-%m-%d %H:%M:%S"), device_id],
+            [key, expiry_str, device_id],
             fetch=False
         )
         
+        print(f"[DEBUG] Kết quả cập nhật: {result}")
+        
         # Thêm log
         try:
+            print(f"[DEBUG] Thêm log cho thao tác tạo key")
             execute_query(
                 "INSERT INTO logs (mac, hostname, action, performed_by, timestamp) VALUES (%s, %s, %s, %s, NOW())",
-                [device[0]['mac'], device[0]['hostname'], "generate_key", user_id],
+                [device['mac'], device['hostname'], "generate_key", user_id],
                 fetch=False
             )
         except Exception as log_error:
             print(f"[API Warning] Lỗi ghi log: {str(log_error)}")
         
+        print(f"[DEBUG] Hoàn tất tạo key, trả về kết quả")
         return {
             "success": True,
             "message": "Key generated successfully",
             "key": key,
-            "expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S")
+            "expires_at": expiry_str
         }
-    except HTTPException:
-        raise
     except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"[API ERROR] Lỗi tạo key: {str(e)}")
+        print(f"[API ERROR] Chi tiết lỗi:\n{error_detail}")
         raise HTTPException(
             status_code=500,
-            detail=f"Error generating key: {str(e)}"
+            detail=f"Error generating key for device: {str(e)}"
         )
-
-# Create new device
-@app.post("/api/devices")
-async def create_device(device: DeviceCreate):
     try:
         result = execute_query(
             "INSERT INTO devices (mac, hostname, key_code, active, added_by, created_at) VALUES (%s, %s, %s, %s, %s, NOW())",
@@ -649,6 +690,65 @@ async def activate_device_with_key(device: DeviceActivateWithKey):
             status_code=500,
             detail=f"Error updating device activation: {str(e)}"
         )
+
+# API đơn giản để tạo key (không yêu cầu user_id)
+@app.get("/generate-key/{device_id}")
+async def create_simple_key(device_id: int):
+    """Tạo key cho thiết bị với ID cụ thể (phiên bản đơn giản)"""
+    try:
+        print(f"[API] Tạo key đơn giản cho thiết bị ID={device_id}")
+        
+        # Kiểm tra thiết bị tồn tại
+        device = execute_query(
+            "SELECT * FROM devices WHERE id = %s",
+            [device_id],
+            fetch=True,
+            many=False
+        )
+        
+        if not device:
+            raise HTTPException(status_code=404, detail="Không tìm thấy thiết bị")
+        
+        # Tạo key và cập nhật
+        key = generate_random_key()
+        current_time = datetime.datetime.now()
+        expires_at = current_time + datetime.timedelta(days=365)  # Hết hạn sau 1 năm
+        expiry_str = expires_at.strftime("%Y-%m-%d %H:%M:%S")
+        
+        execute_query(
+            "UPDATE devices SET key_code = %s, expires_at = %s WHERE id = %s",
+            [key, expiry_str, device_id],
+            fetch=False
+        )
+        
+        # Thêm log
+        try:
+            execute_query(
+                "INSERT INTO logs (mac, hostname, action, performed_by, timestamp) VALUES (%s, %s, %s, %s, NOW())",
+                [device['mac'], device['hostname'], 'generate_key', 1],
+                fetch=False
+            )
+        except Exception as log_error:
+            print(f"[API Warning] Lỗi ghi log: {str(log_error)}")
+        
+        return {
+            "success": True,
+            "device_id": device_id,
+            "key": key,
+            "message": "Key được tạo thành công!"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        error_detail = traceback.format_exc()
+        print(f"[API ERROR] Lỗi tạo key đơn giản: {str(e)}")
+        print(f"[API ERROR] Chi tiết lỗi:\n{error_detail}")
+        return {
+            "success": False,
+            "error": f"Lỗi: {str(e)}"
+        }
 
 # Reset device status
 @app.post("/api/devices/{device_id}/reset")
@@ -1155,7 +1255,9 @@ if __name__ == "__main__":
     import uvicorn
     from dotenv import load_dotenv
     import os
+    import socket
     
+    # Tải biến môi trường
     load_dotenv()
     port = int(os.getenv("PORT", 3001))
     
@@ -1180,25 +1282,15 @@ if __name__ == "__main__":
         connection.commit()
         cursor.close()
         connection.close()
-        print("[Server] Bảng user_permissions đã được kiểm tra/tạo")
+        print("[Server] Bang user_permissions da duoc kiem tra/tao")
     except Exception as e:
-        print(f"[Server Warning] Không thể khởi tạo bảng permissions: {e}")
+        print(f"[Server Warning] Khong the khoi tao bang permissions: {e}")
     
-    # Bind to all network interfaces (0.0.0.0) to allow connections from other devices
-    print(f"\n[Server] Starting API server on 0.0.0.0:{port}")
-    print(f"[Server] Server URL for client app: http://<your-ip-here>:{port}")
-    
-    uvicorn.run(app, host="0.0.0.0", port=port)
-
-# Khởi động ứng dụng
-if __name__ == "__main__":
-    import socket
     # Lấy địa chỉ IP của máy tính này trên mạng
     hostname = socket.gethostname()
     ip_address = socket.gethostbyname(hostname)
-    port = int(os.getenv("PORT", 3001))
     
-    # In ra thong tin ket noi de client app biet (khong dau tieng Viet de tranh loi encoding)
+    # In ra thong tin ket noi
     print(f"\n*** SERVER INFO ***")
     print(f"API Server running at: http://{ip_address}:{port}")
     print(f"CLIENT APP need to connect to: http://{ip_address}:{port}/api")
